@@ -11,10 +11,7 @@ import { resolveHeartbeatPrompt } from "../../../auto-reply/heartbeat.js";
 import { resolveChannelCapabilities } from "../../../config/channel-capabilities.js";
 import type { OpenClawConfig } from "../../../config/config.js";
 import { getMachineDisplayName } from "../../../infra/machine-name.js";
-import {
-  ensureGlobalUndiciEnvProxyDispatcher,
-  ensureGlobalUndiciStreamTimeouts,
-} from "../../../infra/net/undici-global-dispatcher.js";
+import { ensureGlobalUndiciStreamTimeouts } from "../../../infra/net/undici-global-dispatcher.js";
 import { MAX_IMAGE_BYTES } from "../../../media/constants.js";
 import { getGlobalHookRunner } from "../../../plugins/hook-runner-global.js";
 import type {
@@ -296,6 +293,221 @@ function normalizeToolCallNameForDispatch(rawName: string, allowedToolNames?: Se
   return trimmed;
 }
 
+const QWEN_TEXTUAL_TOOL_CALL_RE = /<\s*tool_call\s*>([\s\S]*?)<\s*\/\s*tool_call\s*>/gi;
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function resolveTextualToolCallArguments(value: unknown): Record<string, unknown> | null {
+  if (value == null) {
+    return {};
+  }
+  if (isPlainRecord(value)) {
+    return value;
+  }
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    return isPlainRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function parsePureTextualToolCallText(
+  text: string,
+  allowedToolNames?: Set<string>,
+): Array<{ type: "toolCall"; name: string; arguments: Record<string, unknown> }> | null {
+  if (!/tool_call/i.test(text)) {
+    return null;
+  }
+  const matches = [...text.matchAll(QWEN_TEXTUAL_TOOL_CALL_RE)];
+  if (matches.length === 0) {
+    return null;
+  }
+  const remainder = text.replace(QWEN_TEXTUAL_TOOL_CALL_RE, "").trim();
+  if (remainder) {
+    return null;
+  }
+
+  const blocks: Array<{ type: "toolCall"; name: string; arguments: Record<string, unknown> }> = [];
+  for (const match of matches) {
+    const payloadText = match[1]?.trim();
+    if (!payloadText) {
+      return null;
+    }
+
+    let parsedPayload: unknown;
+    try {
+      parsedPayload = JSON.parse(payloadText);
+    } catch {
+      return null;
+    }
+    if (!isPlainRecord(parsedPayload)) {
+      return null;
+    }
+
+    const rawName = typeof parsedPayload.name === "string" ? parsedPayload.name : "";
+    const normalizedName = normalizeToolCallNameForDispatch(rawName, allowedToolNames);
+    if (!normalizedName.trim()) {
+      return null;
+    }
+    if (allowedToolNames && allowedToolNames.size > 0) {
+      let allowed = false;
+      for (const candidate of allowedToolNames) {
+        if (candidate.toLowerCase() === normalizedName.toLowerCase()) {
+          allowed = true;
+          break;
+        }
+      }
+      if (!allowed) {
+        return null;
+      }
+    }
+
+    const rawArgs = Object.hasOwn(parsedPayload, "arguments")
+      ? parsedPayload.arguments
+      : Object.hasOwn(parsedPayload, "parameters")
+        ? parsedPayload.parameters
+        : Object.hasOwn(parsedPayload, "input")
+          ? parsedPayload.input
+          : Object.hasOwn(parsedPayload, "args")
+            ? parsedPayload.args
+            : undefined;
+    const argumentsObject = resolveTextualToolCallArguments(rawArgs);
+    if (!argumentsObject) {
+      return null;
+    }
+
+    blocks.push({
+      type: "toolCall",
+      name: normalizedName,
+      arguments: argumentsObject,
+    });
+  }
+
+  return blocks.length > 0 ? blocks : null;
+}
+
+function promoteTextualToolCallsInMessage(message: unknown, allowedToolNames?: Set<string>): void {
+  if (!message || typeof message !== "object") {
+    return;
+  }
+  const typedMessage = message as {
+    role?: unknown;
+    content?: unknown;
+    stopReason?: unknown;
+  };
+  if (typedMessage.role !== "assistant" || !Array.isArray(typedMessage.content)) {
+    return;
+  }
+
+  const nextContent: unknown[] = [];
+  let changed = false;
+  for (const block of typedMessage.content) {
+    if (!block || typeof block !== "object") {
+      nextContent.push(block);
+      continue;
+    }
+    const typedBlock = block as { type?: unknown; text?: unknown };
+    if (typedBlock.type !== "text" || typeof typedBlock.text !== "string") {
+      nextContent.push(block);
+      continue;
+    }
+    const parsedBlocks = parsePureTextualToolCallText(typedBlock.text, allowedToolNames);
+    if (!parsedBlocks) {
+      nextContent.push(block);
+      continue;
+    }
+    nextContent.push(...parsedBlocks);
+    changed = true;
+  }
+
+  if (!changed) {
+    return;
+  }
+  typedMessage.content = nextContent;
+  if (typedMessage.stopReason !== "error") {
+    typedMessage.stopReason = "toolUse";
+  }
+}
+
+function wrapStreamPromoteTextualToolCalls(
+  stream: ReturnType<typeof streamSimple>,
+  allowedToolNames?: Set<string>,
+): ReturnType<typeof streamSimple> {
+  const originalResult = stream.result.bind(stream);
+  stream.result = async () => {
+    const message = await originalResult();
+    promoteTextualToolCallsInMessage(message, allowedToolNames);
+    return message;
+  };
+
+  const originalAsyncIterator = stream[Symbol.asyncIterator].bind(stream);
+  (stream as { [Symbol.asyncIterator]: typeof originalAsyncIterator })[Symbol.asyncIterator] =
+    function () {
+      const iterator = originalAsyncIterator();
+      return {
+        async next() {
+          const result = await iterator.next();
+          if (!result.done && result.value && typeof result.value === "object") {
+            const event = result.value as { partial?: unknown; message?: unknown };
+            promoteTextualToolCallsInMessage(event.partial, allowedToolNames);
+            promoteTextualToolCallsInMessage(event.message, allowedToolNames);
+          }
+          return result;
+        },
+        async return(value?: unknown) {
+          return iterator.return?.(value) ?? { done: true as const, value: undefined };
+        },
+        async throw(error?: unknown) {
+          return iterator.throw?.(error) ?? { done: true as const, value: undefined };
+        },
+      };
+    };
+
+  return stream;
+}
+
+export function wrapStreamFnPromoteTextualToolCalls(
+  baseFn: StreamFn,
+  allowedToolNames?: Set<string>,
+): StreamFn {
+  return (model, context, options) => {
+    const maybeStream = baseFn(model, context, options);
+    if (maybeStream && typeof maybeStream === "object" && "then" in maybeStream) {
+      return Promise.resolve(maybeStream).then((stream) =>
+        wrapStreamPromoteTextualToolCalls(stream, allowedToolNames),
+      );
+    }
+    return wrapStreamPromoteTextualToolCalls(maybeStream, allowedToolNames);
+  };
+}
+
+function shouldPromoteTextualToolCallResponses(params: {
+  provider: string;
+  modelId: string;
+  api: unknown;
+}): boolean {
+  if (params.api !== "openai-completions") {
+    return false;
+  }
+  const normalizedProvider = normalizeProviderId(params.provider);
+  const normalizedModelId = params.modelId.toLowerCase();
+  return (
+    normalizedProvider === "qwen" ||
+    normalizedProvider === "qwen-portal" ||
+    normalizedModelId.includes("qwen")
+  );
+}
+
 function isToolCallBlockType(type: unknown): boolean {
   return type === "toolCall" || type === "toolUse" || type === "functionCall";
 }
@@ -434,281 +646,6 @@ export function wrapStreamFnTrimToolCallNames(
     }
     return wrapStreamTrimToolCallNames(maybeStream, allowedToolNames);
   };
-}
-
-function extractBalancedJsonPrefix(raw: string): string | null {
-  let start = 0;
-  while (start < raw.length && /\s/.test(raw[start] ?? "")) {
-    start += 1;
-  }
-  const startChar = raw[start];
-  if (startChar !== "{" && startChar !== "[") {
-    return null;
-  }
-
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let i = start; i < raw.length; i += 1) {
-    const char = raw[i];
-    if (char === undefined) {
-      break;
-    }
-    if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (char === "\\") {
-        escaped = true;
-      } else if (char === '"') {
-        inString = false;
-      }
-      continue;
-    }
-    if (char === '"') {
-      inString = true;
-      continue;
-    }
-    if (char === "{" || char === "[") {
-      depth += 1;
-      continue;
-    }
-    if (char === "}" || char === "]") {
-      depth -= 1;
-      if (depth === 0) {
-        return raw.slice(start, i + 1);
-      }
-    }
-  }
-  return null;
-}
-
-const MAX_TOOLCALL_REPAIR_BUFFER_CHARS = 64_000;
-const MAX_TOOLCALL_REPAIR_TRAILING_CHARS = 3;
-const TOOLCALL_REPAIR_ALLOWED_TRAILING_RE = /^[^\s{}[\]":,\\]{1,3}$/;
-
-function shouldAttemptMalformedToolCallRepair(partialJson: string, delta: string): boolean {
-  if (/[}\]]/.test(delta)) {
-    return true;
-  }
-  const trimmedDelta = delta.trim();
-  return (
-    trimmedDelta.length > 0 &&
-    trimmedDelta.length <= MAX_TOOLCALL_REPAIR_TRAILING_CHARS &&
-    /[}\]]/.test(partialJson)
-  );
-}
-
-type ToolCallArgumentRepair = {
-  args: Record<string, unknown>;
-  trailingSuffix: string;
-};
-
-function tryParseMalformedToolCallArguments(raw: string): ToolCallArgumentRepair | undefined {
-  if (!raw.trim()) {
-    return undefined;
-  }
-  try {
-    JSON.parse(raw);
-    return undefined;
-  } catch {
-    const jsonPrefix = extractBalancedJsonPrefix(raw);
-    if (!jsonPrefix) {
-      return undefined;
-    }
-    const suffix = raw.slice(raw.indexOf(jsonPrefix) + jsonPrefix.length).trim();
-    if (
-      suffix.length === 0 ||
-      suffix.length > MAX_TOOLCALL_REPAIR_TRAILING_CHARS ||
-      !TOOLCALL_REPAIR_ALLOWED_TRAILING_RE.test(suffix)
-    ) {
-      return undefined;
-    }
-    try {
-      const parsed = JSON.parse(jsonPrefix) as unknown;
-      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-        ? { args: parsed as Record<string, unknown>, trailingSuffix: suffix }
-        : undefined;
-    } catch {
-      return undefined;
-    }
-  }
-}
-
-function repairToolCallArgumentsInMessage(
-  message: unknown,
-  contentIndex: number,
-  repairedArgs: Record<string, unknown>,
-): void {
-  if (!message || typeof message !== "object") {
-    return;
-  }
-  const content = (message as { content?: unknown }).content;
-  if (!Array.isArray(content)) {
-    return;
-  }
-  const block = content[contentIndex];
-  if (!block || typeof block !== "object") {
-    return;
-  }
-  const typedBlock = block as { type?: unknown; arguments?: unknown };
-  if (!isToolCallBlockType(typedBlock.type)) {
-    return;
-  }
-  typedBlock.arguments = repairedArgs;
-}
-
-function clearToolCallArgumentsInMessage(message: unknown, contentIndex: number): void {
-  if (!message || typeof message !== "object") {
-    return;
-  }
-  const content = (message as { content?: unknown }).content;
-  if (!Array.isArray(content)) {
-    return;
-  }
-  const block = content[contentIndex];
-  if (!block || typeof block !== "object") {
-    return;
-  }
-  const typedBlock = block as { type?: unknown; arguments?: unknown };
-  if (!isToolCallBlockType(typedBlock.type)) {
-    return;
-  }
-  typedBlock.arguments = {};
-}
-
-function repairMalformedToolCallArgumentsInMessage(
-  message: unknown,
-  repairedArgsByIndex: Map<number, Record<string, unknown>>,
-): void {
-  if (!message || typeof message !== "object") {
-    return;
-  }
-  const content = (message as { content?: unknown }).content;
-  if (!Array.isArray(content)) {
-    return;
-  }
-  for (const [index, repairedArgs] of repairedArgsByIndex.entries()) {
-    repairToolCallArgumentsInMessage(message, index, repairedArgs);
-  }
-}
-
-function wrapStreamRepairMalformedToolCallArguments(
-  stream: ReturnType<typeof streamSimple>,
-): ReturnType<typeof streamSimple> {
-  const partialJsonByIndex = new Map<number, string>();
-  const repairedArgsByIndex = new Map<number, Record<string, unknown>>();
-  const disabledIndices = new Set<number>();
-  const loggedRepairIndices = new Set<number>();
-  const originalResult = stream.result.bind(stream);
-  stream.result = async () => {
-    const message = await originalResult();
-    repairMalformedToolCallArgumentsInMessage(message, repairedArgsByIndex);
-    partialJsonByIndex.clear();
-    repairedArgsByIndex.clear();
-    disabledIndices.clear();
-    loggedRepairIndices.clear();
-    return message;
-  };
-
-  const originalAsyncIterator = stream[Symbol.asyncIterator].bind(stream);
-  (stream as { [Symbol.asyncIterator]: typeof originalAsyncIterator })[Symbol.asyncIterator] =
-    function () {
-      const iterator = originalAsyncIterator();
-      return {
-        async next() {
-          const result = await iterator.next();
-          if (!result.done && result.value && typeof result.value === "object") {
-            const event = result.value as {
-              type?: unknown;
-              contentIndex?: unknown;
-              delta?: unknown;
-              partial?: unknown;
-              message?: unknown;
-              toolCall?: unknown;
-            };
-            if (
-              typeof event.contentIndex === "number" &&
-              Number.isInteger(event.contentIndex) &&
-              event.type === "toolcall_delta" &&
-              typeof event.delta === "string"
-            ) {
-              if (disabledIndices.has(event.contentIndex)) {
-                return result;
-              }
-              const nextPartialJson =
-                (partialJsonByIndex.get(event.contentIndex) ?? "") + event.delta;
-              if (nextPartialJson.length > MAX_TOOLCALL_REPAIR_BUFFER_CHARS) {
-                partialJsonByIndex.delete(event.contentIndex);
-                repairedArgsByIndex.delete(event.contentIndex);
-                disabledIndices.add(event.contentIndex);
-                return result;
-              }
-              partialJsonByIndex.set(event.contentIndex, nextPartialJson);
-              if (shouldAttemptMalformedToolCallRepair(nextPartialJson, event.delta)) {
-                const repair = tryParseMalformedToolCallArguments(nextPartialJson);
-                if (repair) {
-                  repairedArgsByIndex.set(event.contentIndex, repair.args);
-                  repairToolCallArgumentsInMessage(event.partial, event.contentIndex, repair.args);
-                  repairToolCallArgumentsInMessage(event.message, event.contentIndex, repair.args);
-                  if (!loggedRepairIndices.has(event.contentIndex)) {
-                    loggedRepairIndices.add(event.contentIndex);
-                    log.warn(
-                      `repairing kimi-coding tool call arguments after ${repair.trailingSuffix.length} trailing chars`,
-                    );
-                  }
-                } else {
-                  repairedArgsByIndex.delete(event.contentIndex);
-                  clearToolCallArgumentsInMessage(event.partial, event.contentIndex);
-                  clearToolCallArgumentsInMessage(event.message, event.contentIndex);
-                }
-              }
-            }
-            if (
-              typeof event.contentIndex === "number" &&
-              Number.isInteger(event.contentIndex) &&
-              event.type === "toolcall_end"
-            ) {
-              const repairedArgs = repairedArgsByIndex.get(event.contentIndex);
-              if (repairedArgs) {
-                if (event.toolCall && typeof event.toolCall === "object") {
-                  (event.toolCall as { arguments?: unknown }).arguments = repairedArgs;
-                }
-                repairToolCallArgumentsInMessage(event.partial, event.contentIndex, repairedArgs);
-                repairToolCallArgumentsInMessage(event.message, event.contentIndex, repairedArgs);
-              }
-              partialJsonByIndex.delete(event.contentIndex);
-              disabledIndices.delete(event.contentIndex);
-              loggedRepairIndices.delete(event.contentIndex);
-            }
-          }
-          return result;
-        },
-        async return(value?: unknown) {
-          return iterator.return?.(value) ?? { done: true as const, value: undefined };
-        },
-        async throw(error?: unknown) {
-          return iterator.throw?.(error) ?? { done: true as const, value: undefined };
-        },
-      };
-    };
-
-  return stream;
-}
-
-export function wrapStreamFnRepairMalformedToolCallArguments(baseFn: StreamFn): StreamFn {
-  return (model, context, options) => {
-    const maybeStream = baseFn(model, context, options);
-    if (maybeStream && typeof maybeStream === "object" && "then" in maybeStream) {
-      return Promise.resolve(maybeStream).then((stream) =>
-        wrapStreamRepairMalformedToolCallArguments(stream),
-      );
-    }
-    return wrapStreamRepairMalformedToolCallArguments(maybeStream);
-  };
-}
-
-function shouldRepairMalformedAnthropicToolCallArguments(provider?: string): boolean {
-  return normalizeProviderId(provider ?? "") === "kimi-coding";
 }
 
 // ---------------------------------------------------------------------------
@@ -1027,9 +964,6 @@ export async function runEmbeddedAttempt(
   const resolvedWorkspace = resolveUserPath(params.workspaceDir);
   const prevCwd = process.cwd();
   const runAbortController = new AbortController();
-  // Proxy bootstrap must happen before timeout tuning so the timeouts wrap the
-  // active EnvHttpProxyAgent instead of being replaced by a bare proxy dispatcher.
-  ensureGlobalUndiciEnvProxyDispatcher();
   ensureGlobalUndiciStreamTimeouts();
 
   log.debug(
@@ -1646,6 +1580,22 @@ export async function runEmbeddedAttempt(
         };
       }
 
+      // Some Qwen OpenAI-compatible backends emit raw `<tool_call>{...}</tool_call>`
+      // text instead of structured tool blocks. Promote those responses into
+      // real toolCall blocks before the agent loop tries to dispatch tools.
+      if (
+        shouldPromoteTextualToolCallResponses({
+          provider: params.provider,
+          modelId: params.modelId,
+          api: params.model.api,
+        })
+      ) {
+        activeSession.agent.streamFn = wrapStreamFnPromoteTextualToolCalls(
+          activeSession.agent.streamFn,
+          allowedToolNames,
+        );
+      }
+
       // Some models emit tool names with surrounding whitespace (e.g. " read ").
       // pi-agent-core dispatches tool calls with exact string matching, so normalize
       // names on the live response stream before tool execution.
@@ -1653,15 +1603,6 @@ export async function runEmbeddedAttempt(
         activeSession.agent.streamFn,
         allowedToolNames,
       );
-
-      if (
-        params.model.api === "anthropic-messages" &&
-        shouldRepairMalformedAnthropicToolCallArguments(params.provider)
-      ) {
-        activeSession.agent.streamFn = wrapStreamFnRepairMalformedToolCallArguments(
-          activeSession.agent.streamFn,
-        );
-      }
 
       if (isXaiProvider(params.provider, params.modelId)) {
         activeSession.agent.streamFn = wrapStreamFnDecodeXaiToolCallArguments(
@@ -2058,8 +1999,6 @@ export async function runEmbeddedAttempt(
                   sessionId: params.sessionId,
                   workspaceDir: params.workspaceDir,
                   messageProvider: params.messageProvider ?? undefined,
-                  trigger: params.trigger,
-                  channelId: params.messageChannel ?? params.messageProvider ?? undefined,
                 },
               )
               .catch((err) => {
@@ -2268,8 +2207,6 @@ export async function runEmbeddedAttempt(
                 sessionId: params.sessionId,
                 workspaceDir: params.workspaceDir,
                 messageProvider: params.messageProvider ?? undefined,
-                trigger: params.trigger,
-                channelId: params.messageChannel ?? params.messageProvider ?? undefined,
               },
             )
             .catch((err) => {
@@ -2330,8 +2267,6 @@ export async function runEmbeddedAttempt(
               sessionId: params.sessionId,
               workspaceDir: params.workspaceDir,
               messageProvider: params.messageProvider ?? undefined,
-              trigger: params.trigger,
-              channelId: params.messageChannel ?? params.messageProvider ?? undefined,
             },
           )
           .catch((err) => {
